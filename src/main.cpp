@@ -11,26 +11,28 @@
 #define BLIND_NAME "TS3000"
 #define BLIND_COUNT 2
 
-// Global variables for BLE connection
 struct BlindConnection {
     BLEClient* client = nullptr;
     boolean isConnected = false;
-    int currentPosition = 0;
     String name;
     BLEAddress address;
 };
 
 std::vector<BlindConnection> blindConnections(BLIND_COUNT);
+unsigned long lastKeepalive = 0;
+static const unsigned long KEEPALIVE_INTERVAL = 30000; // 30 seconds
+
+// Global variables for position control
+int pendingPosition = -1;
+unsigned long lastPositionChange = 0;
+static const unsigned long DEBOUNCE_DELAY = 1200; // 1.2 seconds (as homekit sends every 1 sec)
 
 // Utility functions for hex conversion
 byte hexToByte(const char* hex) {
     byte val = 0;
     for(int i = 0; i < 2; i++) {
-        char c = hex[i];
         val <<= 4;
-        if(c >= '0' && c <= '9') val |= c - '0';
-        else if(c >= 'a' && c <= 'f') val |= c - 'a' + 10;
-        else if(c >= 'A' && c <= 'F') val |= c - 'A' + 10;
+        val |= (hex[i] >= 'A') ? (hex[i] - 'A' + 10) : (hex[i] - '0');
     }
     return val;
 }
@@ -38,252 +40,106 @@ byte hexToByte(const char* hex) {
 std::vector<byte> hexStringToBytes(const String& hexString) {
     std::vector<byte> bytes;
     for(unsigned int i = 0; i < hexString.length(); i += 2) {
-        String byteString = hexString.substring(i, i + 2);
-        byte b = hexToByte(byteString.c_str());
-        bytes.push_back(b);
+        bytes.push_back(hexToByte(hexString.substring(i, i+2).c_str()));
     }
     return bytes;
 }
 
-String byteToHex(byte b) {
-    String hex = String(b, HEX);
-    if(hex.length() == 1) hex = "0" + hex;
-    return hex;
+// Use the original working version
+String calculateSetPositionCommand(int position) {
+    String callStr = "ff78ea41bf03";
+    int outHex = round(((position * 10) % 256));
+    if(outHex == 256) outHex = 0;
+    
+    String groupStr;
+    if(position < 23.2) groupStr = "00";
+    else if(position < 48.8) groupStr = "01";
+    else if(position < 74.4) groupStr = "02";
+    else groupStr = "03";
+    
+    char hexVal[3];
+    sprintf(hexVal, "%02X", outHex);
+    return callStr + String(hexVal) + groupStr;
 }
 
-// BLE notification callback
-void notifyCallback(BLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-    String response = "";
-    for(int i = 0; i < length; i++) {
-        response += byteToHex(pData[i]);
-    }
-    Serial.printf("Received notification: %s\n", response.c_str());
+void sendCommandToBlind(const String& command, BlindConnection& blind) {
+    if(!blind.isConnected || !blind.client || !blind.client->isConnected()) return;
     
-    if(length >= 9 && pData[4] == 0xD1) {
-        int position = (pData[7] + (256 * pData[8])) / 10;
-        std::string clientAddress = pRemoteCharacteristic->getRemoteService()->getClient()->getPeerAddress().toString();
-        
-        for(auto& blind : blindConnections) {
-            if(blind.client && blind.address.toString().compare(clientAddress) == 0) {
-                blind.currentPosition = 100 - position;
-                Serial.printf("Current position for blind %s: %d\n", blind.address.toString().c_str(), blind.currentPosition);
-                break;
-            }
+    BLERemoteService* pService = blind.client->getService(SERVICE_UUID);
+    if(pService) {
+        BLERemoteCharacteristic* pChar = pService->getCharacteristic(WRITE_UUID);
+        if(pChar) {
+            std::vector<byte> bytes = hexStringToBytes(command);
+            pChar->writeValue((const uint8_t*)bytes.data(), bytes.size());
+            Serial.printf("Sent command to blind %s: %s\n", blind.address.toString().c_str(), command.c_str());
         }
     }
 }
 
-// Main blind control class
+void sendCommandToAllBlinds(const String& command) {
+    for(auto& blind : blindConnections) {
+        sendCommandToBlind(command, blind);
+    }
+}
+
+bool connectToBlinds() {
+    Serial.println("Starting BLE scan...");
+    BLEScan* pScan = BLEDevice::getScan();
+    std::vector<BLEAdvertisedDevice> foundBlinds;
+    
+    class BlindScanCallback: public BLEAdvertisedDeviceCallbacks {
+    public:
+        std::vector<BLEAdvertisedDevice>* blinds;
+        BlindScanCallback(std::vector<BLEAdvertisedDevice>* b) : blinds(b) {}
+        
+        void onResult(BLEAdvertisedDevice* device) {
+            if(device->haveName() && device->getName() == BLIND_NAME) {
+                blinds->push_back(*device);
+            }
+        }
+    };
+    
+    pScan->setAdvertisedDeviceCallbacks(new BlindScanCallback(&foundBlinds));
+    pScan->setInterval(100);
+    pScan->setWindow(99);
+    pScan->start(5, false);
+    
+    for(auto& device : foundBlinds) {
+        for(auto& blind : blindConnections) {
+            if(!blind.isConnected) {
+                blind.client = BLEDevice::createClient();
+                if(!blind.client->connect(device.getAddress())) continue;
+                
+                BLERemoteService* pService = blind.client->getService(SERVICE_UUID);
+                if(!pService) {
+                    blind.client->disconnect();
+                    continue;
+                }
+                
+                blind.isConnected = true;
+                blind.address = device.getAddress();
+                blind.name = String(device.getName().c_str());
+                
+                sendCommandToBlind(KEEP_ALIVE, blind);
+                Serial.printf("Connected to blind: %s\n", blind.address.toString().c_str());
+                break;
+            }
+        }
+    }
+    
+    int connectedCount = 0;
+    for(const auto& blind : blindConnections) {
+        if(blind.isConnected) connectedCount++;
+    }
+    
+    return connectedCount == BLIND_COUNT;
+}
+
 class BlindControl : public Service::WindowCovering {
 private:
     SpanCharacteristic *current;
     SpanCharacteristic *target;
     SpanCharacteristic *state;
-    int pendingPosition = -1;
-    bool pendingDebounce = false;
-    unsigned long lastChange = 0;
-    unsigned long lastKeepalive = 0;
-    static const unsigned long DEBOUNCE_DELAY = 2000;    // 2 seconds
-    static const unsigned long BLE_TIMEOUT = 10000;      // 10 seconds
-    static const unsigned long KEEPALIVE_INTERVAL = 30000; // 30 seconds
-
-    String calculateSetPositionCommand(int position) {
-        String callStr = "ff78ea41bf03";
-        int outHex = round(((position * 10) % 256));
-        if(outHex == 256) outHex = 0;
-        
-        String groupStr;
-        if(position < 23.2) groupStr = "00";
-        else if(position < 48.8) groupStr = "01";
-        else if(position < 74.4) groupStr = "02";
-        else groupStr = "03";
-        
-        String hexVal = byteToHex(outHex);
-        return callStr + hexVal + groupStr;
-    }
-
-    bool connectToBlind() {
-        bool foundAny = false;
-        int connectedCount = 0;
-        std::vector<BLEAdvertisedDevice> foundBlinds;
-        
-        for(auto& blind : blindConnections) {
-            if(blind.isConnected && blind.client && blind.client->isConnected()) {
-                connectedCount++;
-                Serial.printf("Found existing connection: %s\n", blind.address.toString().c_str());
-            }
-        }
-        
-        if(connectedCount == BLIND_COUNT) {
-            Serial.println("All blinds already connected");
-            return true;
-        }
-
-        Serial.println("Starting BLE scan...");
-        BLEScan* pScan = BLEDevice::getScan();
-        
-        class BlindScanCallback: public BLEAdvertisedDeviceCallbacks {
-        public:
-            std::vector<BLEAdvertisedDevice>* blinds;
-            BlindScanCallback(std::vector<BLEAdvertisedDevice>* b) : blinds(b) {}
-            
-            void onResult(BLEAdvertisedDevice* device) {
-                if(device->haveName() && device->getName() == BLIND_NAME) {
-                    blinds->push_back(*device);
-                    if(blinds->size() >= BLIND_COUNT) {
-                        BLEDevice::getScan()->stop();
-                    }
-                }
-            }
-        };
-        
-        pScan->setAdvertisedDeviceCallbacks(new BlindScanCallback(&foundBlinds));
-        pScan->setInterval(100);
-        pScan->setWindow(99);
-        pScan->clearResults();
-        
-        esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
-        esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
-
-        uint32_t scanStart = millis();
-        pScan->start(0, false);
-        
-        while(foundBlinds.size() < BLIND_COUNT && (millis() - scanStart < BLE_TIMEOUT)) {
-            delay(10);
-        }
-        pScan->stop();
-        
-        Serial.printf("Scan complete. Found %d blinds\n", foundBlinds.size());
-        
-        for(auto& device : foundBlinds) {
-            Serial.printf("Processing blind: %s\n", device.getAddress().toString().c_str());
-            
-            bool alreadyConnected = false;
-            for(auto& blind : blindConnections) {
-                if(blind.isConnected && blind.client && blind.client->isConnected() && 
-                   blind.address.equals(device.getAddress())) {
-                    alreadyConnected = true;
-                    break;
-                }
-            }
-            
-            if(alreadyConnected) continue;
-            
-            for(auto& blind : blindConnections) {
-                if(!blind.isConnected || !blind.client || !blind.client->isConnected()) {
-                    if(blind.client != nullptr) {
-                        if(blind.client->isConnected()) blind.client->disconnect();
-                        blind.client = nullptr;
-                    }
-                    
-                    blind.client = BLEDevice::createClient();
-                    if(!blind.client) continue;
-                    
-                    Serial.printf("Connecting to %s\n", device.getAddress().toString().c_str());
-                    
-                    if(!blind.client->connect(device.getAddress())) {
-                        Serial.println("Connection failed");
-                        blind.client = nullptr;
-                        continue;
-                    }
-                    
-                    Serial.println("Connected, setting up services...");
-                    
-                    BLERemoteService* pService = blind.client->getService(SERVICE_UUID);
-                    if(!pService) {
-                        blind.client->disconnect();
-                        blind.client = nullptr;
-                        continue;
-                    }
-                    
-                    BLERemoteCharacteristic* pChar = pService->getCharacteristic(NOTIFY_UUID);
-                    if(!pChar) {
-                        blind.client->disconnect();
-                        blind.client = nullptr;
-                        continue;
-                    }
-                    
-                    if(pChar->canNotify()) {
-                        pChar->subscribe(true, notifyCallback);
-                    }
-                    
-                    sendCommandToBlind(KEEP_ALIVE, blind);
-                    
-                    blind.isConnected = true;
-                    blind.name = String(BLIND_NAME);
-                    blind.address = device.getAddress();
-                    connectedCount++;
-                    foundAny = true;
-                    
-                    Serial.printf("Blind %s ready\n", blind.address.toString().c_str());
-                    break;
-                }
-            }
-            
-            if(connectedCount >= BLIND_COUNT) break;
-        }
-        
-        Serial.printf("Connection process complete. Connected count: %d\n", connectedCount);
-        return foundAny;
-    }
-
-    void maintainConnections() {
-        if (millis() - lastKeepalive >= KEEPALIVE_INTERVAL) {
-            for (auto& blind : blindConnections) {
-                if (blind.isConnected && blind.client && blind.client->isConnected()) {
-                    sendCommandToBlind(KEEP_ALIVE, blind);
-                }
-            }
-            lastKeepalive = millis();
-        }
-        
-        // Check if any connections were lost
-        for (auto& blind : blindConnections) {
-            if (blind.isConnected && (!blind.client || !blind.client->isConnected())) {
-                blind.isConnected = false;
-            }
-        }
-        
-        if (!areAllBlindsConnected()) {
-            connectToBlind();
-        }
-    }
-
-    bool areAllBlindsConnected() {
-        int count = 0;
-        for (const auto& blind : blindConnections) {
-            if (blind.isConnected && blind.client && blind.client->isConnected()) count++;
-        }
-        return count == BLIND_COUNT;
-    }
-
-    void sendCommandToBlind(const String& command, BlindConnection& blind) {
-        if(!blind.isConnected || !blind.client || !blind.client->isConnected()) return;
-        
-        BLERemoteService* pService = blind.client->getService(SERVICE_UUID);
-        if(pService) {
-            BLERemoteCharacteristic* pChar = pService->getCharacteristic(WRITE_UUID);
-            if(pChar) {
-                std::vector<byte> bytes = hexStringToBytes(command);
-                pChar->writeValue((const uint8_t*)bytes.data(), bytes.size());
-                Serial.printf("Sent command to blind %s: %s\n", blind.address.toString().c_str(), command.c_str());
-            }
-        }
-    }
-
-    void sendCommandToAllBlinds(const String& command) {
-        for(auto& blind : blindConnections) {
-            sendCommandToBlind(command, blind);
-        }
-    }
-
-    void getPosition() {
-        sendCommandToAllBlinds("ff78ea41d10301");
-    }
-
-    void stopBlinds() {
-        sendCommandToAllBlinds("ff78ea415f0301");
-    }
 
 public:
     BlindControl() : Service::WindowCovering() {
@@ -295,62 +151,23 @@ public:
     boolean update() {
         if(target->getNewVal() != target->getVal()) {
             pendingPosition = target->getNewVal();
-            lastChange = millis();
-            pendingDebounce = true;
-            Serial.printf("Position change requested: %d (debouncing for 2s)\n", pendingPosition);
+            lastPositionChange = millis();
+            Serial.printf("Position change requested: %d\n", pendingPosition);
             return true;
         }
         return true;
     }
-
-    void checkAndHandleMove() {
-        maintainConnections();  // Keep connections alive
-        
-        if (pendingDebounce && (millis() - lastChange >= DEBOUNCE_DELAY)) {
-            pendingDebounce = false;
-            
-            if (areAllBlindsConnected() || connectToBlind()) {
-                state->setVal(pendingPosition > current->getVal() ? 1 : 0);
-                
-                String command = calculateSetPositionCommand(pendingPosition);
-                sendCommandToAllBlinds(command);
-                
-                delay(500);
-                
-                current->setVal(pendingPosition);
-                target->setVal(pendingPosition);
-                state->setVal(2);
-            }
-            
-            pendingPosition = -1;
-        }
-    }
 };
-
-// Store a pointer to our BlindControl instance
-BlindControl* blindControlInstance = nullptr;
 
 void setup() {
     Serial.begin(115200);
-    while(!Serial) delay(100);
-    Serial.println("Starting up...");
-
-    homeSpan.setStatusPin(2);
-    homeSpan.setControlPin(0);
-    homeSpan.setPairingCode("46637726");
     
-    Serial.println("Initializing HomeSpan...");
+    homeSpan.setPairingCode("46637726");
     homeSpan.begin(Category::WindowCoverings, "Blind Controller");
     
-    Serial.println("Initializing BLE...");
-    
     BLEDevice::init("HomeKit Blind Controller");
-    
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
-    
-    Serial.println("BLE initialized successfully");
-    Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
     
     new SpanAccessory();
         new Service::AccessoryInformation();
@@ -360,16 +177,41 @@ void setup() {
             new Characteristic::Model("Smart Blind Controller");
             new Characteristic::FirmwareRevision("1.0");
             new Characteristic::Identify();
+        new BlindControl();
     
-    blindControlInstance = new BlindControl();
-        
-    Serial.println("Setup complete!");
+    // Initial connection to blinds
+    connectToBlinds();
 }
 
 void loop() {
     homeSpan.poll();
     
-    if (blindControlInstance) {
-        blindControlInstance->checkAndHandleMove();
+    // Check for disconnected blinds
+    static unsigned long lastConnectionCheck = 0;
+    if(millis() - lastConnectionCheck > 5000) {  // Check every 5 seconds
+        bool needReconnect = false;
+        for(auto& blind : blindConnections) {
+            if(blind.isConnected && (!blind.client || !blind.client->isConnected())) {
+                blind.isConnected = false;
+                needReconnect = true;
+            }
+        }
+        if(needReconnect) {
+            connectToBlinds();
+        }
+        lastConnectionCheck = millis();
+    }
+    
+    // Send keepalive
+    if(millis() - lastKeepalive > KEEPALIVE_INTERVAL) {
+        sendCommandToAllBlinds(KEEP_ALIVE);
+        lastKeepalive = millis();
+    }
+    
+    // Handle pending position changes
+    if(pendingPosition >= 0 && (millis() - lastPositionChange > DEBOUNCE_DELAY)) {
+        String command = calculateSetPositionCommand(pendingPosition);
+        sendCommandToAllBlinds(command);
+        pendingPosition = -1;
     }
 }
